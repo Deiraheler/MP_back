@@ -1,6 +1,14 @@
 import ApiError from "../utils/ApiError.js";
 import catchAsync from "../utils/catchAsync.js";
 import * as appointmentService from "../services/appointment.service.js";
+import {
+  addSseClient,
+  removeSseClient,
+  getExistingTranscriptions,
+  handleAudioChunk,
+} from "../services/transcription.service.js";
+import { verifyToken } from "../utils/jwt.js";
+import { User } from "../models/User.js";
 
 // List all appointments
 const listAppointments = catchAsync(async (req, res) => {
@@ -92,6 +100,182 @@ const deleteLetterPrompt = catchAsync(async (req, res) => {
   res.status(200).json(appointment.letter.additionalPrompts);
 });
 
+// SSE stream for live transcriptions for a given appointment
+const streamTranscriptions = async (req, res, next) => {
+  try {
+    const { id: appointmentId } = req.params;
+
+    // Support auth via query token (for EventSource) or Authorization header
+    const header = req.headers["authorization"] || "";
+    let token = req.query.token;
+    if (!token && header.startsWith("Bearer ")) {
+      token = header.split(" ")[1];
+    }
+
+    if (!token) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    let decoded;
+    try {
+      decoded = verifyToken(token);
+    } catch (err) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const userId = decoded.userId || decoded._id || decoded.id;
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await User.findById(userId).select("_id firstName lastName email profession");
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    // Set SSE headers
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+
+    const userKey = user._id.toString();
+
+    // Register client
+    addSseClient({ userId: userKey, appointmentId, res });
+
+    // Send any existing transcription chunks
+    const existing = await getExistingTranscriptions({ userId: userKey, appointmentId });
+    for (const chunk of existing) {
+      const payload = JSON.stringify({ type: "chunk", chunk });
+      res.write(`data: ${payload}\n\n`);
+    }
+
+    // Handle disconnect
+    req.on("close", () => {
+      removeSseClient({ userId: userKey, appointmentId, res });
+      try {
+        res.end();
+      } catch {
+        // ignore
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Receive raw audio chunks for an appointment and forward to Deepgram
+const uploadAudioChunk = catchAsync(async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+
+  if (!userId) {
+    throw new ApiError(401, "Unauthorized");
+  }
+
+  const audioBuffer = req.body;
+  const contentType = req.headers["content-type"] || "audio/webm";
+
+  if (!audioBuffer || !audioBuffer.length) {
+    return res.status(400).json({ message: "Empty audio payload" });
+  }
+
+  await handleAudioChunk({ userId, appointmentId, audioBuffer, contentType });
+
+  res.status(200).json({ ok: true });
+});
+
+// Generate a treatment note HTML for an appointment and persist it
+const generateTreatmentNote = catchAsync(async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    throw new ApiError(401, "Unauthorized");
+  }
+
+  const note = await appointmentService.generateTreatmentNoteForAppointment({
+    appointmentId,
+    userId,
+    templateId,
+    noteId,
+  });
+
+  res.status(200).json({ note });
+});
+
+// Generate a letter HTML for an appointment and persist it
+const generateLetter = catchAsync(async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    throw new ApiError(401, "Unauthorized");
+  }
+
+  const note = await appointmentService.generateTreatmentNoteForAppointment({
+    appointmentId,
+    userId,
+    templateId,
+    noteId,
+    forceType: "letter",
+  });
+
+  res.status(200).json({ note });
+});
+
+// Generate a patient summary HTML for an appointment and persist it
+const generateSummary = catchAsync(async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    throw new ApiError(401, "Unauthorized");
+  }
+
+  const note = await appointmentService.generateTreatmentNoteForAppointment({
+    appointmentId,
+    userId,
+    templateId,
+    noteId,
+    forceType: "summary",
+  });
+
+  res.status(200).json({ note });
+});
+
+// Upload treatment note to Cliniko
+const writeNotes = catchAsync(async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { noteId, noteBody, draft } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    throw new ApiError(401, "Unauthorized");
+  }
+
+  if (!noteBody) {
+    throw new ApiError(400, "noteBody is required");
+  }
+
+  const result = await appointmentService.writeNotesToCliniko({
+    appointmentId,
+    userId,
+    noteId,
+    noteBody,
+    draft: draft !== undefined ? draft : true,
+  });
+
+  res.status(200).json(result);
+});
+
 export {
   listAppointments,
   getAppointment,
@@ -102,5 +286,11 @@ export {
   deleteTreatmentPrompt,
   addLetterPrompt,
   deleteLetterPrompt,
+  streamTranscriptions,
+  uploadAudioChunk,
+  generateTreatmentNote,
+  generateLetter,
+  generateSummary,
+  writeNotes,
 };
 

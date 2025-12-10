@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { NoteSchema } from "./Note.js";
 
 const appointmentSchema = new mongoose.Schema(
   {
@@ -61,6 +62,15 @@ const appointmentSchema = new mongoose.Schema(
         },
       ],
     },
+    // Streaming transcription chunks for this appointment
+    // Each chunk represents a partial transcript with a server-side timestamp
+    transcriptions: [
+      {
+        text: { type: String },
+        timestamp: { type: Date },
+      },
+    ],
+    notes: [NoteSchema],
   },
   { timestamps: true }
 );

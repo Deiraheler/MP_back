@@ -1,8 +1,17 @@
 import { Appointment } from "../models/Appointment.js";
+import { Template } from "../models/Template.js";
+import { Note } from "../models/Note.js";
 // import { TranscriptionGeneration } from "../models/index.js"; // Uncomment when model exists
 import clinikoAxios from "../utils/clinikoAxios.js";
 import * as clinikoService from "./cliniko.service.js";
 import ApiError from "../utils/ApiError.js";
+import {
+  generateTreatmentNoteHtml,
+  generateLetterHtml,
+  generateSummaryHtml,
+} from "./openai.service.js";
+import he from "he";
+import axios from "axios";
 
 async function getAppointments({ userId, status, appointmentId, date, businessId, page = 1, limit = 10, newOnly } = {}) {
   // If date is provided and we're not looking for newOnly, fetch from Cliniko
@@ -166,7 +175,10 @@ async function getAppointments({ userId, status, appointmentId, date, businessId
 }
 
 async function getAppointmentById(id) {
-  const appointment = await Appointment.findOne({ appointmentId: id });
+  const appointment = await Appointment.findOne({ appointmentId: id }).populate({
+    path: "notes.templateId",
+    select: "name type",
+  });
   if (!appointment) return null;
 
   // Convert to plain object to add extra fields
@@ -378,6 +390,139 @@ async function updateAppointment(id, updates) {
  */
 async function updateAppointmentStatus(id, status) {
   return Appointment.findOneAndUpdate({ appointmentId: id }, { status }, { new: true });
+}
+
+/**
+ * Generate a treatment note HTML for an appointment using a stored template and transcript.
+ */
+async function generateTreatmentNoteForAppointment({ appointmentId, userId, templateId, noteId, forceType }) {
+  if (!templateId && !noteId) {
+    throw new ApiError(400, "templateId or noteId is required");
+  }
+
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  })
+    .select(
+      "transcriptions treatmentNote patientInfo referralContact appointmentDate status notes"
+    )
+    .lean();
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const targetTemplateId =
+    templateId ||
+    appointment.notes?.find((n) => n._id?.toString() === noteId)?.templateId?.toString();
+
+  if (!targetTemplateId) {
+    throw new ApiError(400, "templateId is required");
+  }
+
+  const template = await Template.findOne({
+    _id: targetTemplateId,
+    user: userId,
+  })
+    .select("name type content")
+    .lean();
+
+  if (!template) {
+    throw new ApiError(404, "Template not found");
+  }
+
+  const transcriptText = (appointment.transcriptions || [])
+    .map((t) => {
+      const ts = t.timestamp ? new Date(t.timestamp).toISOString() : "";
+      return ts ? `[${ts}] ${t.text || ""}` : t.text || "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  const additionalPrompts = (appointment.treatmentNote?.additionalPrompts || [])
+    .map((p) => p?.content)
+    .filter(Boolean);
+
+  const context = {
+    appointmentId,
+    status: appointment.status,
+    appointmentDate: appointment.appointmentDate,
+    patient: appointment.patientInfo || null,
+    referralContact: appointment.referralContact || null,
+    templateMeta: {
+      id: templateId,
+      name: template.name,
+      type: template.type,
+    },
+  };
+
+  const typeLower = forceType || (template.type || "").toLowerCase();
+  let generator = generateTreatmentNoteHtml;
+  if (typeLower === "letter") {
+    generator = generateLetterHtml;
+  } else if (typeLower === "patient summary" || typeLower === "summary") {
+    generator = generateSummaryHtml;
+  }
+
+  const noteHtml = await generator({
+    templateHtml: template.content || "",
+    transcriptText,
+    context,
+    additionalPrompts,
+  });
+
+  let note;
+  if (noteId) {
+    // Update existing note text
+    const updated = await Appointment.findOneAndUpdate(
+      { appointmentId, user: userId, "notes._id": noteId },
+      { $set: { "notes.$.text": noteHtml, "notes.$.templateId": template._id } },
+      { new: true, projection: { notes: 1 } }
+    )
+      .populate({ path: "notes.templateId", select: "name type" })
+      .lean();
+    note = updated?.notes?.find((n) => n._id?.toString() === noteId?.toString());
+  } else {
+    // Create new note
+    const newNote = new Note({
+      templateId: template._id,
+      text: noteHtml,
+    });
+
+    const update = {
+      $push: { notes: newNote },
+    };
+    if (!appointment.status || appointment.status === "not_recorded") {
+      update.$set = { status: "recorded" };
+    }
+
+    const updated = await Appointment.findOneAndUpdate(
+      { appointmentId, user: userId },
+      update,
+      { new: true, projection: { notes: 1, status: 1 } }
+    )
+      .populate({ path: "notes.templateId", select: "name type" })
+      .lean();
+
+    if (updated?.notes?.length) {
+      // The new note will be the last item in the array
+      note = updated.notes[updated.notes.length - 1];
+    }
+  }
+
+  if (!note) {
+    throw new ApiError(500, "Failed to save note");
+  }
+
+  return {
+    _id: note._id,
+    templateId: note.templateId?._id || note.templateId,
+    templateType: note.templateId?.type || template.type,
+    templateName: note.templateId?.name || template.name,
+    text: note.text,
+    created: note.created,
+  };
 }
 
 /**
@@ -716,6 +861,236 @@ async function fetchAppointmentsFromCliniko(userId, date, businessId = null) {
   }
 }
 
+/**
+ * Parse HTML note and upload to Cliniko as treatment note
+ * Adapted from the old writeNotes function
+ */
+async function writeNotesToCliniko({ appointmentId, userId, noteId, noteBody, draft = true }) {
+  // Get appointment with patient info
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  })
+    .populate({ path: "notes.templateId", select: "name type" })
+    .lean();
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const patientId = appointment.patientInfo?.id;
+  if (!patientId) {
+    throw new ApiError(400, "Patient ID not found in appointment");
+  }
+
+  // Get user's Cliniko credentials
+  const userDetails = await clinikoService.getPractitionerDetails(userId);
+  if (!userDetails || !userDetails.basicAuth || !userDetails.apiRegion) {
+    throw new ApiError(400, "Cliniko API credentials not found");
+  }
+
+  // Get template ID - try from note, then from user settings (if available)
+  let clinikoTemplateId = null;
+  if (noteId) {
+    const note = appointment.notes?.find((n) => n._id?.toString() === noteId?.toString());
+    // Note: We don't store clinikoTemplateId in Template model, so we'd need to add it
+    // For now, we'll use a default or get it from user settings if available
+  }
+
+  // STEP 1 — Decode HTML entities
+  let html = he.decode(noteBody || "");
+
+  // STEP 1.5 — Add <br> after each </p> tag before sanitization
+  html = html.replace(/<\/p>/gi, "</p><br>");
+
+  // STEP 2 — Normalize strong/em to b/i
+  html = html
+    .replace(/<strong>/gi, "<b>")
+    .replace(/<\/strong>/gi, "</b>")
+    .replace(/<em>/gi, "<i>")
+    .replace(/<\/em>/gi, "</i>");
+
+  // STEP 3 — Remove ALL tags except <i>, <b>, <br>
+  html = html.replace(/<(?!\/?(i|b|br)\b)[^>]*>/gi, "");
+  // Remove <p> tags specifically
+  html = html.replace(/<\/?p[^>]*>/gi, "");
+  html = html.trim();
+
+  // Replace </b><br> with just </b>
+  html = html.replace(/<\/b><br>/gi, "</b>");
+
+  // STEP 4 — PARSER
+  // <i> = section name
+  // <b> = question name
+  // text under <b> until next <b> or <i> = answer
+  const sectionsArr = [];
+  let currentSection = null;
+  let currentQuestion = null;
+
+  // Split by tags while keeping tags in the array
+  const tokens = html.split(/(?=<i>|<b>)/gi);
+
+  for (let token of tokens) {
+    token = token.trim();
+    if (!token) continue;
+
+    // NEW SECTION (<i>)
+    if (token.startsWith("<i>")) {
+      const name = token.match(/^<i>(.*?)<\/i>/i)?.[1]?.trim() || "Section";
+      currentSection = {
+        name,
+        questions: [],
+      };
+      sectionsArr.push(currentSection);
+      currentQuestion = null;
+      continue;
+    }
+
+    // NEW QUESTION (<b>)
+    if (token.startsWith("<b>")) {
+      const header = token.match(/^<b>(.*?)<\/b>/i)?.[1]?.trim() || "Question";
+      const answerHtml = token.replace(/^<b>[\s\S]*?<\/b>/i, "").trim();
+
+      // If no section yet, create default
+      if (!currentSection) {
+        currentSection = {
+          name: "Clinic Notes",
+          questions: [],
+        };
+        sectionsArr.push(currentSection);
+      }
+
+      const q = {
+        name: header,
+        answer: `<p>${answerHtml}</p>`,
+        type: "paragraph",
+      };
+
+      currentSection.questions.push(q);
+      currentQuestion = q;
+      continue;
+    }
+
+    // ANSWER CONTINUATION
+    if (currentQuestion) {
+      currentQuestion.answer = currentQuestion.answer.replace("</p>", "") + "<br>" + token + "</p>";
+    }
+  }
+
+  // FINAL FALLBACK — NO <i> or <b> at all
+  if (sectionsArr.length === 0) {
+    sectionsArr.push({
+      name: "Clinic Notes",
+      questions: [
+        {
+          name: "Details",
+          answer: `<p>${html}</p>`,
+          type: "paragraph",
+        },
+      ],
+    });
+  }
+
+  const sections = sectionsArr;
+
+  // Replace empty <p></p> tags with <br> in all answers
+  sections.forEach((section) => {
+    if (section.questions) {
+      section.questions.forEach((question) => {
+        if (question.answer) {
+          question.answer = question.answer.replace(/<p>\s*<\/p>/gi, "<br>");
+        }
+      });
+    }
+  });
+
+  // STEP 5 — Send to Cliniko
+  try {
+    const apiRegion = userDetails.apiRegion;
+    const baseUrl = `https://api.${apiRegion}.cliniko.com/v1`;
+
+    // Build request body - only include template_id if it's provided
+    const requestBody = {
+      booking_id: appointmentId,
+      content: { sections },
+      draft: draft ?? true,
+      patient_id: patientId,
+      title: "Treatment Note",
+    };
+    
+    // Only include template_id if we have one (don't send empty string)
+    if (clinikoTemplateId) {
+      requestBody.treatment_note_template_id = clinikoTemplateId;
+    }
+
+    // Use axios directly like the old code, matching the exact format
+    const response = await axios.post(
+      `${baseUrl}/treatment_notes`,
+      requestBody,
+      {
+        headers: {
+          Authorization: userDetails.basicAuth,
+          Accept: "application/json",
+          "User-Agent": "MediScribeAI Backend",
+        },
+      }
+    );
+
+    const statusStr = draft ? "Draft" : "Final";
+
+    // Update appointment status
+    await Appointment.findOneAndUpdate(
+      { appointmentId, user: userId },
+      { $set: { status: statusStr } },
+      { new: true }
+    );
+
+    return { message: "Success", data: response.data };
+  } catch (error) {
+    console.error("Cliniko Error:", error);
+    console.log("Error Sections:", JSON.stringify(sections));
+    console.log("Request details:", {
+      appointmentId,
+      patientId,
+      hasTemplateId: !!clinikoTemplateId,
+      draft,
+    });
+    
+    // Handle axios errors
+    if (error.response) {
+      // The request was made and the server responded with a status code
+      // that falls out of the range of 2xx
+      const status = error.response.status;
+      let message = "Unknown error";
+      
+      if (status === 403) {
+        message = "Forbidden: The API key may not have permission to create treatment notes. Please check that the API key is associated with a practitioner who has permission to create treatment notes in Cliniko.";
+      } else if (status === 401) {
+        message = "Unauthorized: The API key is invalid or expired.";
+      } else if (error.response.data) {
+        // Try to extract error message from response
+        if (typeof error.response.data === 'string') {
+          message = error.response.data;
+        } else if (error.response.data.message) {
+          message = error.response.data.message;
+        } else if (error.response.data.error) {
+          message = error.response.data.error;
+        }
+      } else {
+        message = error.message || "Unknown error";
+      }
+      
+      throw new ApiError(status, `Cliniko API error (${status}): ${message}`);
+    } else if (error.request) {
+      // The request was made but no response was received
+      throw new ApiError(500, "No response from Cliniko API");
+    } else {
+      // Something happened in setting up the request
+      throw new ApiError(500, error.message || "Failed to upload note to Cliniko");
+    }
+  }
+}
+
 export {
   getAppointments,
   getAppointmentById,
@@ -723,10 +1098,12 @@ export {
   updateAppointment,
   deleteAppointment,
   updateAppointmentStatus,
+  generateTreatmentNoteForAppointment,
   addTreatmentPrompt,
   deleteTreatmentPrompt,
   addLetterPrompt,
   deleteLetterPrompt,
   fetchAppointmentsFromCliniko,
+  writeNotesToCliniko,
 };
 
