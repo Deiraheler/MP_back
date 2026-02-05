@@ -251,6 +251,104 @@ const generateSummary = catchAsync(async (req, res) => {
   res.status(200).json({ note });
 });
 
+// Streaming note generation - treatment
+const generateTreatmentNoteStream = async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  try {
+    const note = await appointmentService.generateTreatmentNoteForAppointmentStream({
+      appointmentId,
+      userId,
+      templateId,
+      noteId,
+      onChunk: (delta) => send({ delta }),
+    });
+    send({ done: true, note });
+  } catch (err) {
+    send({ error: err.message || "Failed to generate note" });
+  } finally {
+    res.end();
+  }
+};
+
+// Streaming note generation - letter
+const generateLetterStream = async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  try {
+    const note = await appointmentService.generateTreatmentNoteForAppointmentStream({
+      appointmentId,
+      userId,
+      templateId,
+      noteId,
+      forceType: "letter",
+      onChunk: (delta) => send({ delta }),
+    });
+    send({ done: true, note });
+  } catch (err) {
+    send({ error: err.message || "Failed to generate note" });
+  } finally {
+    res.end();
+  }
+};
+
+// Streaming note generation - summary
+const generateSummaryStream = async (req, res) => {
+  const { id: appointmentId } = req.params;
+  const { templateId, noteId } = req.body || {};
+
+  const userId = req.user && req.user._id ? req.user._id.toString() : null;
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  try {
+    const note = await appointmentService.generateTreatmentNoteForAppointmentStream({
+      appointmentId,
+      userId,
+      templateId,
+      noteId,
+      forceType: "summary",
+      onChunk: (delta) => send({ delta }),
+    });
+    send({ done: true, note });
+  } catch (err) {
+    send({ error: err.message || "Failed to generate note" });
+  } finally {
+    res.end();
+  }
+};
+
 // Upload treatment note to Cliniko
 const writeNotes = catchAsync(async (req, res) => {
   const { id: appointmentId } = req.params;
@@ -291,6 +389,9 @@ export {
   generateTreatmentNote,
   generateLetter,
   generateSummary,
+  generateTreatmentNoteStream,
+  generateLetterStream,
+  generateSummaryStream,
   writeNotes,
 };
 

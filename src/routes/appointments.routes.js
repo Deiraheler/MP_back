@@ -30,11 +30,26 @@ router.post(
   controller.generateTreatmentNote
 );
 router.post(
+  "/:id/treatment/generate/stream",
+  authRequired,
+  controller.generateTreatmentNoteStream
+);
+router.post(
   "/:id/letter/generate",
   authRequired,
   controller.generateLetter
 );
+router.post(
+  "/:id/letter/generate/stream",
+  authRequired,
+  controller.generateLetterStream
+);
 router.post("/:id/summary/generate", authRequired, controller.generateSummary);
+router.post(
+  "/:id/summary/generate/stream",
+  authRequired,
+  controller.generateSummaryStream
+);
 
 // Upload treatment note to Cliniko
 router.post("/:id/treatment/upload", authRequired, controller.writeNotes);

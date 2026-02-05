@@ -9,6 +9,9 @@ import {
   generateTreatmentNoteHtml,
   generateLetterHtml,
   generateSummaryHtml,
+  generateTreatmentNoteHtmlStream,
+  generateLetterHtmlStream,
+  generateSummaryHtmlStream,
 } from "./openai.service.js";
 import he from "he";
 import axios from "axios";
@@ -507,6 +510,138 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
 
     if (updated?.notes?.length) {
       // The new note will be the last item in the array
+      note = updated.notes[updated.notes.length - 1];
+    }
+  }
+
+  if (!note) {
+    throw new ApiError(500, "Failed to save note");
+  }
+
+  return {
+    _id: note._id,
+    templateId: note.templateId?._id || note.templateId,
+    templateType: note.templateId?.type || template.type,
+    templateName: note.templateId?.name || template.name,
+    text: note.text,
+    created: note.created,
+  };
+}
+
+/**
+ * Generate a treatment note HTML for an appointment using streaming.
+ * Calls onChunk(delta) for each content delta, then saves and returns the note.
+ */
+async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId, templateId, noteId, forceType, onChunk }) {
+  if (!templateId && !noteId) {
+    throw new ApiError(400, "templateId or noteId is required");
+  }
+
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  })
+    .select(
+      "transcriptions treatmentNote patientInfo referralContact appointmentDate status notes"
+    )
+    .lean();
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const targetTemplateId =
+    templateId ||
+    appointment.notes?.find((n) => n._id?.toString() === noteId)?.templateId?.toString();
+
+  if (!targetTemplateId) {
+    throw new ApiError(400, "templateId is required");
+  }
+
+  const template = await Template.findOne({
+    _id: targetTemplateId,
+    user: userId,
+  })
+    .select("name type content")
+    .lean();
+
+  if (!template) {
+    throw new ApiError(404, "Template not found");
+  }
+
+  const transcriptText = (appointment.transcriptions || [])
+    .map((t) => {
+      const ts = t.timestamp ? new Date(t.timestamp).toISOString() : "";
+      return ts ? `[${ts}] ${t.text || ""}` : t.text || "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  const additionalPrompts = (appointment.treatmentNote?.additionalPrompts || [])
+    .map((p) => p?.content)
+    .filter(Boolean);
+
+  const context = {
+    appointmentId,
+    status: appointment.status,
+    appointmentDate: appointment.appointmentDate,
+    patient: appointment.patientInfo || null,
+    referralContact: appointment.referralContact || null,
+    templateMeta: {
+      id: templateId,
+      name: template.name,
+      type: template.type,
+    },
+  };
+
+  const typeLower = forceType || (template.type || "").toLowerCase();
+  let generator;
+  if (typeLower === "letter") {
+    generator = generateLetterHtmlStream;
+  } else if (typeLower === "patient summary" || typeLower === "summary") {
+    generator = generateSummaryHtmlStream;
+  } else {
+    generator = generateTreatmentNoteHtmlStream;
+  }
+
+  const noteHtml = await generator({
+    templateHtml: template.content || "",
+    transcriptText,
+    context,
+    additionalPrompts,
+    onChunk,
+  });
+
+  let note;
+  if (noteId) {
+    const updated = await Appointment.findOneAndUpdate(
+      { appointmentId, user: userId, "notes._id": noteId },
+      { $set: { "notes.$.text": noteHtml, "notes.$.templateId": template._id } },
+      { new: true, projection: { notes: 1 } }
+    )
+      .populate({ path: "notes.templateId", select: "name type" })
+      .lean();
+    note = updated?.notes?.find((n) => n._id?.toString() === noteId?.toString());
+  } else {
+    const newNote = new Note({
+      templateId: template._id,
+      text: noteHtml,
+    });
+
+    const update = { $push: { notes: newNote } };
+    if (!appointment.status || appointment.status === "not_recorded") {
+      update.$set = { status: "recorded" };
+    }
+
+    const updated = await Appointment.findOneAndUpdate(
+      { appointmentId, user: userId },
+      update,
+      { new: true, projection: { notes: 1, status: 1 } }
+    )
+      .populate({ path: "notes.templateId", select: "name type" })
+      .lean();
+
+    if (updated?.notes?.length) {
       note = updated.notes[updated.notes.length - 1];
     }
   }
@@ -1099,6 +1234,7 @@ export {
   deleteAppointment,
   updateAppointmentStatus,
   generateTreatmentNoteForAppointment,
+  generateTreatmentNoteForAppointmentStream,
   addTreatmentPrompt,
   deleteTreatmentPrompt,
   addLetterPrompt,
