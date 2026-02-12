@@ -54,6 +54,12 @@ router.post(
 // Upload treatment note to Cliniko
 router.post("/:id/treatment/upload", authRequired, controller.writeNotes);
 
+// Copilot: note-level chat and instructions (stored in notes[].copilot)
+router.get("/:id/notes/:noteId/copilot", authRequired, controller.getCopilot);
+router.patch("/:id/notes/:noteId", authRequired, controller.patchNote);
+router.post("/:id/notes/:noteId/instructions", authRequired, controller.addNoteInstruction);
+router.post("/:id/notes/:noteId/copilot/chat", authRequired, controller.copilotChat);
+
 // Streaming transcription: SSE for transcript output
 router.get("/:id/transcription/stream", controller.streamTranscriptions);
 

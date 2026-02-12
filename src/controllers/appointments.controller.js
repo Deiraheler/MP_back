@@ -254,7 +254,7 @@ const generateSummary = catchAsync(async (req, res) => {
 // Streaming note generation - treatment
 const generateTreatmentNoteStream = async (req, res) => {
   const { id: appointmentId } = req.params;
-  const { templateId, noteId } = req.body || {};
+  const { templateId, noteId, useCurrentNote } = req.body || {};
 
   const userId = req.user && req.user._id ? req.user._id.toString() : null;
   if (!userId) {
@@ -273,6 +273,7 @@ const generateTreatmentNoteStream = async (req, res) => {
       userId,
       templateId,
       noteId,
+      useCurrentNote: useCurrentNote === true,
       onChunk: (delta) => send({ delta }),
     });
     send({ done: true, note });
@@ -286,7 +287,7 @@ const generateTreatmentNoteStream = async (req, res) => {
 // Streaming note generation - letter
 const generateLetterStream = async (req, res) => {
   const { id: appointmentId } = req.params;
-  const { templateId, noteId } = req.body || {};
+  const { templateId, noteId, useCurrentNote } = req.body || {};
 
   const userId = req.user && req.user._id ? req.user._id.toString() : null;
   if (!userId) {
@@ -306,6 +307,7 @@ const generateLetterStream = async (req, res) => {
       templateId,
       noteId,
       forceType: "letter",
+      useCurrentNote: useCurrentNote === true,
       onChunk: (delta) => send({ delta }),
     });
     send({ done: true, note });
@@ -319,7 +321,7 @@ const generateLetterStream = async (req, res) => {
 // Streaming note generation - summary
 const generateSummaryStream = async (req, res) => {
   const { id: appointmentId } = req.params;
-  const { templateId, noteId } = req.body || {};
+  const { templateId, noteId, useCurrentNote } = req.body || {};
 
   const userId = req.user && req.user._id ? req.user._id.toString() : null;
   if (!userId) {
@@ -339,6 +341,7 @@ const generateSummaryStream = async (req, res) => {
       templateId,
       noteId,
       forceType: "summary",
+      useCurrentNote: useCurrentNote === true,
       onChunk: (delta) => send({ delta }),
     });
     send({ done: true, note });
@@ -374,6 +377,84 @@ const writeNotes = catchAsync(async (req, res) => {
   res.status(200).json(result);
 });
 
+// GET /api/appointments/:id/notes/:noteId/copilot
+const getCopilot = catchAsync(async (req, res) => {
+  const appointmentId = req.params.id;
+  const noteId = req.params.noteId;
+  const userId = req.user?._id?.toString();
+  if (!userId) throw new ApiError(401, "Unauthorized");
+
+  const data = await appointmentService.getCopilotData(appointmentId, userId, noteId);
+  res.status(200).json(data);
+});
+
+// PATCH /api/appointments/:id/notes/:noteId
+const patchNote = catchAsync(async (req, res) => {
+  const appointmentId = req.params.id;
+  const noteId = req.params.noteId;
+  const userId = req.user?._id?.toString();
+  if (!userId) throw new ApiError(401, "Unauthorized");
+  const { text } = req.body || {};
+  if (text == null || typeof text !== "string") throw new ApiError(400, "text is required");
+
+  const { note } = await appointmentService.updateNoteText(appointmentId, userId, noteId, text);
+  res.status(200).json({ note });
+});
+
+// POST /api/appointments/:id/notes/:noteId/instructions
+const addNoteInstruction = catchAsync(async (req, res) => {
+  const appointmentId = req.params.id;
+  const noteId = req.params.noteId;
+  const userId = req.user?._id?.toString();
+  if (!userId) throw new ApiError(401, "Unauthorized");
+  const { content, key } = req.body || {};
+
+  const result = await appointmentService.addNoteInstruction(
+    appointmentId,
+    userId,
+    noteId,
+    content,
+    key,
+    req.user._id
+  );
+  res.status(200).json(result);
+});
+
+// POST /api/appointments/:id/notes/:noteId/copilot/chat (streaming SSE)
+const copilotChat = async (req, res) => {
+  const appointmentId = req.params.id;
+  const noteId = req.params.noteId;
+  const userId = req.user?._id?.toString();
+  const { message } = req.body || {};
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+  if (!message || typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ message: "message is required" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  try {
+    const result = await appointmentService.copilotChatStream({
+      appointmentId,
+      userId,
+      noteId,
+      userMessage: message,
+      onChunk: (delta) => send({ delta }),
+    });
+    send({ done: true, reply: result.reply, messages: result.messages });
+  } catch (err) {
+    send({ error: err.message || "Failed to process copilot chat" });
+  } finally {
+    res.end();
+  }
+};
+
 export {
   listAppointments,
   getAppointment,
@@ -393,5 +474,9 @@ export {
   generateLetterStream,
   generateSummaryStream,
   writeNotes,
+  getCopilot,
+  patchNote,
+  addNoteInstruction,
+  copilotChat,
 };
 

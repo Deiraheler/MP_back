@@ -12,9 +12,74 @@ import {
   generateTreatmentNoteHtmlStream,
   generateLetterHtmlStream,
   generateSummaryHtmlStream,
+  generateCopilotReply,
+  generateCopilotReplyStream,
 } from "./openai.service.js";
 import he from "he";
 import axios from "axios";
+import { generateCopilotId } from "../utils/copilotId.js";
+
+// --- Copilot helpers (instruction resolution, embedded note lookup) ---
+
+/**
+ * Get embedded note by id from appointment document (works with Mongoose doc or lean plain object).
+ */
+function getEmbeddedNote(appointmentDoc, noteId) {
+  if (!appointmentDoc?.notes || !noteId) return null;
+  const idStr = String(noteId);
+  if (typeof appointmentDoc.notes.id === "function") {
+    return appointmentDoc.notes.id(idStr) || null;
+  }
+  return appointmentDoc.notes.find((n) => n._id && String(n._id) === idStr) ?? null;
+}
+
+/**
+ * "Last wins" by key: key null/empty => keep all in order; key present => only last occurrence of that key.
+ * Returned list preserves chronological order of effective instructions (keyless first in order, then keyed by last occurrence).
+ */
+function getEffectiveInstructions(instructions) {
+  if (!Array.isArray(instructions) || instructions.length === 0) return [];
+  const keyless = [];
+  const keyedMap = new Map();
+  const keyedOrder = [];
+  for (const inst of instructions) {
+    const k = inst.key && String(inst.key).trim() ? String(inst.key).trim() : null;
+    if (!k) {
+      keyless.push(inst);
+    } else {
+      if (keyedMap.has(k)) {
+        keyedOrder.splice(keyedOrder.indexOf(k), 1);
+      }
+      keyedOrder.push(k);
+      keyedMap.set(k, inst);
+    }
+  }
+  return [...keyless, ...keyedOrder.map((k) => keyedMap.get(k))];
+}
+
+/**
+ * Format effective instructions as a string block for prompt injection.
+ */
+function formatInstructionsBlock(effectiveInstructions) {
+  if (!effectiveInstructions || effectiveInstructions.length === 0) return "";
+  const lines = effectiveInstructions.map((i) => (i && i.content ? i.content : "").trim()).filter(Boolean);
+  if (lines.length === 0) return "";
+  return "NOTE-LEVEL ADDITIONAL INSTRUCTIONS (highest priority):\n- " + lines.join("\n- ");
+}
+
+function formatChatHistory(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+  return messages
+    .map((m) => {
+      const role = m?.role ? String(m.role) : "assistant";
+      const content = m?.content ? String(m.content).trim() : "";
+      if (!content) return "";
+      return `${role.toUpperCase()}: ${content}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 
 async function getAppointments({ userId, status, appointmentId, date, businessId, page = 1, limit = 10, newOnly } = {}) {
   // If date is provided and we're not looking for newOnly, fetch from Cliniko
@@ -396,9 +461,23 @@ async function updateAppointmentStatus(id, status) {
 }
 
 /**
+ * Resolve additional prompts: note-level (when noteId and note has copilot.instructions) else by type.
+ * Letter uses appointment.letter.additionalPrompts; treatment and summary use treatmentNote.additionalPrompts.
+ */
+function resolveAdditionalPrompts(appointment, embeddedNote, typeLower) {
+  if (embeddedNote?.copilot?.instructions?.length) {
+    return getEffectiveInstructions(embeddedNote.copilot.instructions).map((i) => (i && i.content ? i.content : "").trim()).filter(Boolean);
+  }
+  if (typeLower === "letter") {
+    return (appointment.letter?.additionalPrompts || []).map((p) => p?.content).filter(Boolean);
+  }
+  return (appointment.treatmentNote?.additionalPrompts || []).map((p) => p?.content).filter(Boolean);
+}
+
+/**
  * Generate a treatment note HTML for an appointment using a stored template and transcript.
  */
-async function generateTreatmentNoteForAppointment({ appointmentId, userId, templateId, noteId, forceType }) {
+async function generateTreatmentNoteForAppointment({ appointmentId, userId, templateId, noteId, forceType, useCurrentNote = false }) {
   if (!templateId && !noteId) {
     throw new ApiError(400, "templateId or noteId is required");
   }
@@ -408,7 +487,7 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
     user: userId,
   })
     .select(
-      "transcriptions treatmentNote patientInfo referralContact appointmentDate status notes"
+      "transcriptions treatmentNote letter patientInfo referralContact appointmentDate status notes"
     )
     .lean();
 
@@ -416,6 +495,7 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
     throw new ApiError(404, "Appointment not found");
   }
 
+  const embeddedNote = noteId ? getEmbeddedNote(appointment, noteId) : null;
   const targetTemplateId =
     templateId ||
     appointment.notes?.find((n) => n._id?.toString() === noteId)?.templateId?.toString();
@@ -443,9 +523,9 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
     .filter(Boolean)
     .join("\n");
 
-  const additionalPrompts = (appointment.treatmentNote?.additionalPrompts || [])
-    .map((p) => p?.content)
-    .filter(Boolean);
+  const typeLower = forceType || (template.type || "").toLowerCase();
+  const additionalPrompts = resolveAdditionalPrompts(appointment, embeddedNote, typeLower);
+  const currentNoteHtml = useCurrentNote && embeddedNote?.text ? embeddedNote.text : undefined;
 
   const context = {
     appointmentId,
@@ -460,7 +540,6 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
     },
   };
 
-  const typeLower = forceType || (template.type || "").toLowerCase();
   let generator = generateTreatmentNoteHtml;
   if (typeLower === "letter") {
     generator = generateLetterHtml;
@@ -473,6 +552,7 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
     transcriptText,
     context,
     additionalPrompts,
+    currentNoteHtml,
   });
 
   let note;
@@ -532,7 +612,7 @@ async function generateTreatmentNoteForAppointment({ appointmentId, userId, temp
  * Generate a treatment note HTML for an appointment using streaming.
  * Calls onChunk(delta) for each content delta, then saves and returns the note.
  */
-async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId, templateId, noteId, forceType, onChunk }) {
+async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId, templateId, noteId, forceType, useCurrentNote = false, onChunk }) {
   if (!templateId && !noteId) {
     throw new ApiError(400, "templateId or noteId is required");
   }
@@ -542,7 +622,7 @@ async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId
     user: userId,
   })
     .select(
-      "transcriptions treatmentNote patientInfo referralContact appointmentDate status notes"
+      "transcriptions treatmentNote letter patientInfo referralContact appointmentDate status notes"
     )
     .lean();
 
@@ -550,6 +630,7 @@ async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId
     throw new ApiError(404, "Appointment not found");
   }
 
+  const embeddedNote = noteId ? getEmbeddedNote(appointment, noteId) : null;
   const targetTemplateId =
     templateId ||
     appointment.notes?.find((n) => n._id?.toString() === noteId)?.templateId?.toString();
@@ -577,9 +658,9 @@ async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId
     .filter(Boolean)
     .join("\n");
 
-  const additionalPrompts = (appointment.treatmentNote?.additionalPrompts || [])
-    .map((p) => p?.content)
-    .filter(Boolean);
+  const typeLower = forceType || (template.type || "").toLowerCase();
+  const additionalPrompts = resolveAdditionalPrompts(appointment, embeddedNote, typeLower);
+  const currentNoteHtml = useCurrentNote && embeddedNote?.text ? embeddedNote.text : undefined;
 
   const context = {
     appointmentId,
@@ -594,7 +675,6 @@ async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId
     },
   };
 
-  const typeLower = forceType || (template.type || "").toLowerCase();
   let generator;
   if (typeLower === "letter") {
     generator = generateLetterHtmlStream;
@@ -609,6 +689,7 @@ async function generateTreatmentNoteForAppointmentStream({ appointmentId, userId
     transcriptText,
     context,
     additionalPrompts,
+    currentNoteHtml,
     onChunk,
   });
 
@@ -1226,6 +1307,270 @@ async function writeNotesToCliniko({ appointmentId, userId, noteId, noteBody, dr
   }
 }
 
+/**
+ * Get copilot data (messages, instructions) for a note. Returns empty arrays when missing.
+ */
+async function getCopilotData(appointmentId, userId, noteId) {
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  })
+    .select("notes")
+    .lean();
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const note = getEmbeddedNote(appointment, noteId);
+  if (!note) {
+    throw new ApiError(404, "Note not found");
+  }
+
+  const copilot = note.copilot || {};
+  return {
+    messages: Array.isArray(copilot.messages) ? copilot.messages : [],
+    instructions: Array.isArray(copilot.instructions) ? copilot.instructions : [],
+  };
+}
+
+/**
+ * Persist note text (editor edits) into MongoDB.
+ */
+async function updateNoteText(appointmentId, userId, noteId, text) {
+  const updated = await Appointment.findOneAndUpdate(
+    { appointmentId, user: userId, "notes._id": noteId },
+    { $set: { "notes.$.text": text } },
+    { new: true, projection: { notes: 1 } }
+  )
+    .populate({ path: "notes.templateId", select: "name type" })
+    .lean();
+
+  if (!updated) {
+    throw new ApiError(404, "Appointment not found");
+  }
+  const note = updated.notes?.find((n) => n._id?.toString() === String(noteId));
+  if (!note) {
+    throw new ApiError(404, "Note not found");
+  }
+  return { note };
+}
+
+/**
+ * Add an instruction to note.copilot.instructions; return new instruction and effective list.
+ */
+async function addNoteInstruction(appointmentId, userId, noteId, content, key, authorId) {
+  if (!content || typeof content !== "string" || !content.trim()) {
+    throw new ApiError(400, "content is required");
+  }
+
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  }).select("notes");
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const note = appointment.notes.id(noteId);
+  if (!note) {
+    throw new ApiError(404, "Note not found");
+  }
+
+  if (!note.copilot) {
+    note.copilot = { messages: [], instructions: [] };
+  }
+  if (!Array.isArray(note.copilot.instructions)) {
+    note.copilot.instructions = [];
+  }
+
+  const instruction = {
+    id: generateCopilotId(),
+    content: content.trim(),
+    key: key && String(key).trim() ? String(key).trim() : null,
+    createdAt: new Date(),
+    authorId: authorId || null,
+  };
+  note.copilot.instructions.push(instruction);
+  note.markModified("copilot");
+  await appointment.save();
+
+  const effectiveInstructions = getEffectiveInstructions(note.copilot.instructions);
+  return {
+    instruction: {
+      id: instruction.id,
+      content: instruction.content,
+      key: instruction.key,
+      createdAt: instruction.createdAt,
+      authorId: instruction.authorId,
+    },
+    effectiveInstructions: effectiveInstructions.map((i) => ({
+      id: i.id,
+      content: i.content,
+      key: i.key,
+      createdAt: i.createdAt,
+    })),
+  };
+}
+
+/**
+ * Build copilot context from appointment + note.
+ */
+async function buildCopilotContext(appointmentId, userId, noteId) {
+  const appointment = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  })
+    .select("transcriptions notes")
+    .populate({ path: "notes.templateId", select: "type" })
+    .lean();
+
+  if (!appointment) {
+    throw new ApiError(404, "Appointment not found");
+  }
+
+  const note = getEmbeddedNote(appointment, noteId);
+  if (!note) {
+    throw new ApiError(404, "Note not found");
+  }
+
+  const transcriptText = (appointment.transcriptions || [])
+    .map((t) => (t.timestamp ? `[${new Date(t.timestamp).toISOString()}] ${t.text || ""}` : t.text || ""))
+    .filter(Boolean)
+    .join("\n");
+
+  const templateType = note.templateId?.type || "";
+  const currentNoteText = note.text || "";
+  const chatHistoryText = formatChatHistory(note.copilot?.messages || []);
+  const instructions = note.copilot?.instructions || [];
+  const effective = getEffectiveInstructions(instructions);
+  const effectiveInstructionsText = formatInstructionsBlock(effective);
+
+  return {
+    transcriptText,
+    templateType,
+    currentNoteText,
+    chatHistoryText,
+    effectiveInstructionsText,
+  };
+}
+
+async function appendCopilotMessages({ appointmentId, userId, noteId, userMessage, assistantReply }) {
+  const userMsg = {
+    id: generateCopilotId(),
+    role: "user",
+    content: userMessage.trim(),
+    createdAt: new Date(),
+  };
+  const assistantMsg = {
+    id: generateCopilotId(),
+    role: "assistant",
+    content: assistantReply,
+    createdAt: new Date(),
+  };
+
+  const apptDoc = await Appointment.findOne({
+    appointmentId,
+    user: userId,
+  }).select("notes");
+
+  if (!apptDoc) {
+    throw new ApiError(404, "Appointment not found");
+  }
+  const noteDoc = apptDoc.notes.id(noteId);
+  if (!noteDoc) {
+    throw new ApiError(404, "Note not found");
+  }
+  if (!noteDoc.copilot) {
+    noteDoc.copilot = { messages: [], instructions: [] };
+  }
+  if (!Array.isArray(noteDoc.copilot.messages)) {
+    noteDoc.copilot.messages = [];
+  }
+  noteDoc.copilot.messages.push(userMsg, assistantMsg);
+  noteDoc.markModified("copilot");
+  await apptDoc.save();
+
+  const messages = noteDoc.copilot.messages.map((m) => ({
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    createdAt: m.createdAt,
+  }));
+  return messages;
+}
+
+/**
+ * Append user message, generate assistant reply via OpenAI, append assistant message, persist and return.
+ */
+async function copilotChat(appointmentId, userId, noteId, userMessage) {
+  if (!userMessage || typeof userMessage !== "string" || !userMessage.trim()) {
+    throw new ApiError(400, "message is required");
+  }
+
+  const {
+    transcriptText,
+    templateType,
+    currentNoteText,
+    chatHistoryText,
+    effectiveInstructionsText,
+  } = await buildCopilotContext(appointmentId, userId, noteId);
+
+  const reply = await generateCopilotReply({
+    transcriptText,
+    templateType,
+    currentNoteText,
+    chatHistoryText,
+    effectiveInstructionsText,
+    userMessage: userMessage.trim(),
+  });
+
+  const messages = await appendCopilotMessages({
+    appointmentId,
+    userId,
+    noteId,
+    userMessage,
+    assistantReply: reply,
+  });
+  return { reply, messages };
+}
+
+/**
+ * Streaming copilot chat. Emits deltas via onChunk and persists final assistant reply.
+ */
+async function copilotChatStream({ appointmentId, userId, noteId, userMessage, onChunk }) {
+  if (!userMessage || typeof userMessage !== "string" || !userMessage.trim()) {
+    throw new ApiError(400, "message is required");
+  }
+  const {
+    transcriptText,
+    templateType,
+    currentNoteText,
+    chatHistoryText,
+    effectiveInstructionsText,
+  } = await buildCopilotContext(appointmentId, userId, noteId);
+
+  const reply = await generateCopilotReplyStream({
+    transcriptText,
+    templateType,
+    currentNoteText,
+    chatHistoryText,
+    effectiveInstructionsText,
+    userMessage: userMessage.trim(),
+    onChunk,
+  });
+
+  const messages = await appendCopilotMessages({
+    appointmentId,
+    userId,
+    noteId,
+    userMessage,
+    assistantReply: reply,
+  });
+  return { reply, messages };
+}
+
 export {
   getAppointments,
   getAppointmentById,
@@ -1241,5 +1586,10 @@ export {
   deleteLetterPrompt,
   fetchAppointmentsFromCliniko,
   writeNotesToCliniko,
+  getCopilotData,
+  updateNoteText,
+  addNoteInstruction,
+  copilotChat,
+  copilotChatStream,
 };
 

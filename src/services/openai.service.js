@@ -151,10 +151,105 @@ function stripCodeFences(content) {
     .trim();
 }
 
+function buildCopilotUserContext({
+  transcriptText = "",
+  templateType = "",
+  currentNoteText = "",
+  effectiveInstructionsText = "",
+  chatHistoryText = "",
+  userMessage = "",
+}) {
+  const contextParts = [];
+  if (transcriptText && transcriptText.trim()) {
+    contextParts.push("TRANSCRIPT (appointment):\n" + transcriptText.trim().slice(0, 12000));
+  }
+  if (templateType) {
+    contextParts.push("Template type: " + templateType);
+  }
+  if (currentNoteText && currentNoteText.trim()) {
+    contextParts.push("CURRENT NOTE:\n" + currentNoteText.trim().slice(0, 8000));
+  }
+  if (effectiveInstructionsText && effectiveInstructionsText.trim()) {
+    contextParts.push("NOTE-LEVEL INSTRUCTIONS:\n" + effectiveInstructionsText.trim());
+  }
+  if (chatHistoryText && chatHistoryText.trim()) {
+    contextParts.push("CHAT HISTORY (previous turns):\n" + chatHistoryText.trim());
+  }
+  const contextBlock = contextParts.length ? contextParts.join("\n\n") + "\n\n---\n\n" : "";
+  return contextBlock + "User request: " + (userMessage || "").trim();
+}
+
+const COPILOT_SYSTEM_PROMPT = `
+You are a clinical documentation copilot. Do not invent facts. If information is missing, ask or suggest an instruction. Provide edits/instructions clearly.
+
+When you want the app to regenerate with a new instruction, start your response with a single-line JSON object:
+{"action":"edit","text":"<instruction text>","key":"<optional key>"}
+After that JSON line, include at most 1-2 short sentences.
+
+Critical:
+- Do NOT output a full rewritten treatment note in chat.
+- Do NOT output HTML note content (no <p>, <strong>, etc.).
+- Your primary job is to produce a high-quality instruction for regeneration, not to produce final note text.
+- If user asks to add items (e.g., exercises), put all required details in the JSON "text" instruction.
+- Emit JSON action whenever you have a concrete, ready-to-apply instruction (including implicit edit intents like add/remove/replace/update), even if the user did not explicitly say "edit".
+- If you are asking a question or requesting confirmation, do NOT emit JSON action.
+`.trim();
+
+/**
+ * Copilot chat (non-stream fallback).
+ */
+export async function generateCopilotReply({
+  transcriptText = "",
+  templateType = "",
+  currentNoteText = "",
+  effectiveInstructionsText = "",
+  chatHistoryText = "",
+  userMessage = "",
+}) {
+  const user = buildCopilotUserContext({
+    transcriptText,
+    templateType,
+    currentNoteText,
+    effectiveInstructionsText,
+    chatHistoryText,
+    userMessage,
+  });
+  const content = await callOpenAI({ system: COPILOT_SYSTEM_PROMPT, user });
+  return content.trim();
+}
+
+/**
+ * Copilot chat streaming variant.
+ */
+export async function generateCopilotReplyStream({
+  transcriptText = "",
+  templateType = "",
+  currentNoteText = "",
+  effectiveInstructionsText = "",
+  chatHistoryText = "",
+  userMessage = "",
+  onChunk,
+}) {
+  const user = buildCopilotUserContext({
+    transcriptText,
+    templateType,
+    currentNoteText,
+    effectiveInstructionsText,
+    chatHistoryText,
+    userMessage,
+  });
+  return callOpenAIStream({
+    system: COPILOT_SYSTEM_PROMPT,
+    user,
+    onChunk,
+    stripFences: false,
+  });
+}
+
 /**
  * Call OpenAI with streaming. Yields content deltas via onChunk, returns full content when done.
  */
-async function callOpenAIStream({ system, user, onChunk }) {
+async function callOpenAIStream({ system, user, onChunk, stripFences = true }) {
   const apiKey = process.env.OPEN_AI_KEY;
   if (!apiKey) {
     throw new ApiError(500, "OPEN_AI_KEY is not configured on the server");
@@ -261,6 +356,7 @@ async function callOpenAIStream({ system, user, onChunk }) {
     }
   }
 
+  if (!stripFences) return fullContent.trim();
   return stripCodeFences(fullContent);
 }
 
@@ -272,6 +368,7 @@ export async function generateTreatmentNoteHtml({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
 }) {
   if (!templateHtml || !templateHtml.trim()) {
     throw new ApiError(400, "Template HTML is required to generate a treatment note");
@@ -284,6 +381,10 @@ export async function generateTreatmentNoteHtml({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -324,6 +425,7 @@ TEMPLATE & HTML CONSTRAINTS:
     "TEMPLATE_HTML:",
     templateHtml,
     "",
+    currentNoteBlock,
     additional
       ? "ADDITIONAL INSTRUCTIONS (highest priority, apply when structuring the note):\n- " +
         additional
@@ -344,6 +446,7 @@ export async function generateTreatmentNoteHtmlStream({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
   onChunk,
 }) {
   if (!templateHtml || !templateHtml.trim()) {
@@ -357,6 +460,10 @@ export async function generateTreatmentNoteHtmlStream({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -397,6 +504,7 @@ TEMPLATE & HTML CONSTRAINTS:
     "TEMPLATE_HTML:",
     templateHtml,
     "",
+    currentNoteBlock,
     additional
       ? "ADDITIONAL INSTRUCTIONS (highest priority, apply when structuring the note):\n- " +
         additional
@@ -420,6 +528,7 @@ export async function generateLetterHtml({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
 }) {
   if (!templateHtml || !templateHtml.trim()) {
     throw new ApiError(400, "Template HTML is required to generate a letter");
@@ -433,6 +542,10 @@ export async function generateLetterHtml({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -467,10 +580,12 @@ You are an AI assistant that writes professional, medically accurate referral le
     "- Return only the final HTML (no <html> tags).",
   ];
 
+  if (currentNoteBlock) {
+    userLines.push("", currentNoteBlock);
+  }
   if (additional) {
     userLines.push("", "Additional Instructions:", additional);
   }
-
   if (patientReferralBlock) {
     userLines.push(
       "",
@@ -489,6 +604,7 @@ export async function generateLetterHtmlStream({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
   onChunk,
 }) {
   if (!templateHtml || !templateHtml.trim()) {
@@ -503,6 +619,10 @@ export async function generateLetterHtmlStream({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -537,10 +657,12 @@ You are an AI assistant that writes professional, medically accurate referral le
     "- Return only the final HTML (no <html> tags).",
   ];
 
+  if (currentNoteBlock) {
+    userLines.push("", currentNoteBlock);
+  }
   if (additional) {
     userLines.push("", "Additional Instructions:", additional);
   }
-
   if (patientReferralBlock) {
     userLines.push(
       "",
@@ -562,6 +684,7 @@ export async function generateSummaryHtml({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
 }) {
   if (!transcriptText || !transcriptText.trim()) {
     throw new ApiError(400, "No transcript text available for this appointment");
@@ -572,6 +695,10 @@ export async function generateSummaryHtml({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -603,10 +730,12 @@ You are an AI assistant that writes clear, friendly After-Visit Summaries for pa
     "- Return only HTML snippets (no <html>/<body> tags).",
   ];
 
+  if (currentNoteBlock) {
+    userLines.push("", currentNoteBlock);
+  }
   if (additional) {
     userLines.push("", "Additional Instructions:", additional);
   }
-
   if (patientReferralBlock) {
     userLines.push(
       "",
@@ -625,6 +754,7 @@ export async function generateSummaryHtmlStream({
   transcriptText,
   context = {},
   additionalPrompts = [],
+  currentNoteHtml,
   onChunk,
 }) {
   if (!transcriptText || !transcriptText.trim()) {
@@ -636,6 +766,10 @@ export async function generateSummaryHtmlStream({
   const additional =
     additionalPrompts && additionalPrompts.length
       ? additionalPrompts.join("\n- ")
+      : "";
+  const currentNoteBlock =
+    currentNoteHtml && currentNoteHtml.trim()
+      ? "CURRENT NOTE (user-edited baseline; prefer preserving unless instructions say otherwise):\n" + currentNoteHtml.trim()
       : "";
   const patientReferralBlock = buildPatientAndReferralContext(context);
 
@@ -667,10 +801,12 @@ You are an AI assistant that writes clear, friendly After-Visit Summaries for pa
     "- Return only HTML snippets (no <html>/<body> tags).",
   ];
 
+  if (currentNoteBlock) {
+    userLines.push("", currentNoteBlock);
+  }
   if (additional) {
     userLines.push("", "Additional Instructions:", additional);
   }
-
   if (patientReferralBlock) {
     userLines.push(
       "",
